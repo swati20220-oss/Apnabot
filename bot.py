@@ -17,15 +17,17 @@ from telegram.ext import (
 from pymongo import MongoClient
 
 # -------------------------------------------------------------
-# FLASK WEB SERVER (Render Port Binding Ke Liye)
+# FLASK WEB SERVER (Background Thread Ke Liye)
 # -------------------------------------------------------------
 flask_app = Flask(__name__)
-
-bot_started = False  # Flag to prevent multiple bot loops
 
 @flask_app.route('/')
 def health_check():
     return "Bot is alive and running 24/7!", 200
+
+def run_flask_in_background():
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
 
 # -------------------------------------------------------------
 # ENVIRONMENT VARIABLES
@@ -221,12 +223,18 @@ async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed: {e}")
 
 # -------------------------------------------------------------
-# BOT WORKER FUNCTION
+# MAIN BOOTSTRAP (Bot On Main Thread, Flask On Background Thread)
 # -------------------------------------------------------------
-def run_telegram_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+def main():
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN missing!")
+        return
 
+    # 1. Flask Web Server ko Background Thread mein chalao (Render Port Binding ke liye)
+    threading.Thread(target=run_flask_in_background, daemon=True).start()
+    print("🌐 Background Flask Server Started!")
+
+    # 2. Telegram Bot ko MAIN THREAD par chalao
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Handlers
@@ -241,25 +249,14 @@ def run_telegram_bot():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
 
-    # Job Queue (24 Hours Media Poster)
+    # Job Queue
     if app.job_queue:
         app.job_queue.run_repeating(auto_post_media_job, interval=86400, first=10)
 
-    print("🤖 Telegram Bot Polling Started Successfully!")
-    app.run_polling(allowed_updates=["chat_member", "message", "callback_query"])
-
-# -------------------------------------------------------------
-# START BOT WHEN FLASK INITIALIZES (Gunicorn Compatible)
-# -------------------------------------------------------------
-def start_bot_thread():
-    global bot_started
-    if not bot_started:
-        bot_started = True
-        threading.Thread(target=run_telegram_bot, daemon=True).start()
-
-# Automatic Bot Trigger
-start_bot_thread()
+    print("🤖 Telegram Bot Polling Started Successfully On Main Thread!")
+    
+    # Direct Polling on Main Thread (No signal errors!)
+    app.run_polling(allowed_updates=["chat_member", "message", "callback_query"], stop_signals=None)
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
+    main()
