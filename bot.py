@@ -1,7 +1,9 @@
 import os
 import re
 import asyncio
+import threading
 from datetime import datetime
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,13 +16,28 @@ from telegram.ext import (
 )
 from pymongo import MongoClient
 
-# Environment Variables Read Karein
+# -------------------------------------------------------------
+# FLASK WEB SERVER (Render Free Web Service Port Binding Ke Liye)
+# -------------------------------------------------------------
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "Bot is alive and running 24/7!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
+
+# -------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+# -------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Aapki apni Telegram User ID
-SOURCE_GROUP_ID = int(os.getenv("SOURCE_GROUP_ID", "0"))  # Jahan se media uthana hai
-TARGET_GROUP_ID = int(os.getenv("TARGET_GROUP_ID", "0"))  # Jahan media post hona hai
-LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))  # Deleted links log group
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+SOURCE_GROUP_ID = int(os.getenv("SOURCE_GROUP_ID", "0"))
+TARGET_GROUP_ID = int(os.getenv("TARGET_GROUP_ID", "0"))
+LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))
 WELCOME_LINK = os.getenv("WELCOME_LINK", "https://t.me")
 
 # MongoDB Database Connection
@@ -30,14 +47,13 @@ users_col = db['users']
 media_col = db['media_logs']
 stats_col = db['stats']
 
-# URL Detect karne ke liye RegEx
+# URL Detect RegEx
 URL_REGEX = r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+)'
 
 # -------------------------------------------------------------
 # 1. WELCOME & USER REGISTRATION
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User Jab Bot ke DM mein /start dabayega"""
     user = update.effective_user
     if user:
         users_col.update_one(
@@ -51,12 +67,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Naye Group Member ko Welcome karna"""
     result = update.chat_member
     if result.old_chat_member.status in ["left", "kicked"] and result.new_chat_member.status == "member":
         user = result.new_chat_member.user
         
-        # Total joins count update karein
         stats_col.update_one({"_id": "total_joins"}, {"$inc": {"count": 1}}, upsert=True)
 
         user_mention = f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
@@ -81,7 +95,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # 2. LINK DELETE & LOG SYSTEM
 # -------------------------------------------------------------
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Non-admin links delete karna aur source/log group mein bhejna"""
     msg = update.message
     if not msg or not msg.text:
         return
@@ -89,14 +102,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat.id
     user_id = msg.from_user.id
 
-    # Admin check
     chat_member = await context.bot.get_chat_member(chat_id, user_id)
     if chat_member.status in ["administrator", "creator"]:
-        return  # Admin allowed
+        return  # Admin Allowed
 
-    # Agar normal user link bhejta hai
     if re.search(URL_REGEX, msg.text):
-        # 1. Private Log/Source Group mein Copy Bhejo
         log_text = (
             f"⚠️ **Link Deleted Alert**\n"
             f"👤 **User:** {msg.from_user.full_name} (`{user_id}`)\n"
@@ -106,17 +116,15 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if LOG_GROUP_ID != 0:
             await context.bot.send_message(chat_id=LOG_GROUP_ID, text=log_text, parse_mode="Markdown")
 
-        # 2. Original Message Delete Karo
         try:
             await msg.delete()
         except Exception as e:
             print(f"Delete Error: {e}")
 
 # -------------------------------------------------------------
-# 3. SOURCE TO TARGET AUTOMATED MEDIA CRON (Every 24 Hours)
+# 3. SOURCE TO TARGET AUTOMATED MEDIA CRON
 # -------------------------------------------------------------
 async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Source group se media register karna (Source Group Admin / Save)"""
     msg = update.message
     if msg.chat.id == SOURCE_GROUP_ID and (msg.photo or msg.video):
         media_id = msg.photo[-1].file_id if msg.photo else msg.video.file_id
@@ -129,7 +137,6 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
-    """Har 24 Ghante mein 20 Unsent Media Post Karega"""
     if TARGET_GROUP_ID == 0:
         return
 
@@ -141,9 +148,8 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
             elif media['type'] == 'video':
                 await context.bot.send_video(chat_id=TARGET_GROUP_ID, video=media['media_id'])
             
-            # Database mein 'Sent' Mark Karo (Taaki repeat na ho)
             media_col.update_one({"_id": media["_id"]}, {"$set": {"sent": True}})
-            await asyncio.sleep(3)  # Rate-limit safety gap
+            await asyncio.sleep(3)
         except Exception as e:
             print(f"Media post error: {e}")
 
@@ -151,7 +157,6 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
 # 4. IN-BOT DASHBOARD & DUAL BROADCAST SYSTEM
 # -------------------------------------------------------------
 async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin Panel Command: /dashboard"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -174,7 +179,6 @@ async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dashboard Buttons Click Handler"""
     query = update.callback_query
     await query.answer()
 
@@ -184,7 +188,6 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Group Broadcast ke liye likhein:\n`/send_group Aapka Message`", parse_mode="Markdown")
 
 async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Direct Messages Broadcast: /send_users <msg>"""
     if update.effective_user.id != ADMIN_ID:
         return
     
@@ -205,7 +208,6 @@ async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Successful DM Broadcast: {count} users.")
 
 async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Target Group Broadcast: /send_group <msg>"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -228,6 +230,9 @@ def main():
         print("Error: BOT_TOKEN missing!")
         return
 
+    # Background mein Flask Server Run Karo (Port binding fix ke liye)
+    threading.Thread(target=run_flask, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Handlers
@@ -242,7 +247,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
 
-    # Daily 24 Hours Media Auto Poster Job (86400 seconds)
+    # Job Queue (24 Hours Media Poster)
     if app.job_queue:
         app.job_queue.run_repeating(auto_post_media_job, interval=86400, first=10)
 
