@@ -4,6 +4,7 @@ import asyncio
 import threading
 from datetime import datetime
 from flask import Flask
+from google import genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -17,7 +18,7 @@ from telegram.ext import (
 from pymongo import MongoClient
 
 # -------------------------------------------------------------
-# FLASK WEB SERVER (Background Thread Ke Liye)
+# FLASK WEB SERVER (Background Thread For Render 24/7 Alive)
 # -------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -30,15 +31,18 @@ def run_flask_in_background():
     flask_app.run(host="0.0.0.0", port=port)
 
 # -------------------------------------------------------------
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES & CONFIGURATION
 # -------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SOURCE_GROUP_ID = int(os.getenv("SOURCE_GROUP_ID", "0"))
-TARGET_GROUP_ID = int(os.getenv("TARGET_GROUP_ID", "0"))
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))
 WELCOME_LINK = os.getenv("WELCOME_LINK", "https://t.me")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Gemini Client Initialization
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # MongoDB Database Connection
 client = MongoClient(MONGO_URI)
@@ -47,8 +51,23 @@ users_col = db['users']
 media_col = db['media_logs']
 stats_col = db['stats']
 
-# URL Detect RegEx
+# URL Regex Pattern
 URL_REGEX = r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+)'
+
+# Helper function to parse multiple target group IDs (comma separated)
+def get_target_group_ids():
+    raw = os.getenv("TARGET_GROUP_ID", "")
+    if not raw:
+        return []
+    ids = []
+    for x in raw.split(","):
+        x = x.strip()
+        if x:
+            try:
+                ids.append(int(x))
+            except ValueError:
+                pass
+    return ids
 
 # -------------------------------------------------------------
 # 1. WELCOME & USER REGISTRATION
@@ -62,8 +81,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upsert=True
         )
     await update.message.reply_text(
-        f"Namaste {user.first_name}! Main aapka Group Manager Bot hoon.\n"
-        f"Aap ab bot database mein registered hain!"
+        f"Namaste {user.first_name}! Main aapka Multi-Group Manager & Gemini AI Assistant Bot hoon.\n"
+        f"Aap ab bot database mein successfully registered hain!"
     )
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -92,7 +111,50 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 # -------------------------------------------------------------
-# 2. LINK DELETE & LOG SYSTEM
+# 2. GEMINI AI CHATBOT HANDLER
+# -------------------------------------------------------------
+async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text or not ai_client:
+        return
+
+    bot_username = context.bot.username
+    text = msg.text
+
+    # Trigger conditions: Bot Tagged OR Reply to Bot
+    is_tagged = f"@{bot_username}" in text
+    is_reply = (
+        msg.reply_to_message 
+        and msg.reply_to_message.from_user 
+        and msg.reply_to_message.from_user.id == context.bot.id
+    )
+
+    if is_tagged or is_reply:
+        prompt = text.replace(f"@{bot_username}", "").strip()
+        
+        if not prompt:
+            await msg.reply_text("Haan ji, boliye! Main aapki kya help kar sakta hoon?")
+            return
+
+        # Show typing indicator in chat
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
+
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config={
+                    "system_instruction": "Aap ek polite, smart aur helpful Telegram Group Manager aur Assistant hain. Fast, accurate aur friendly Hinglish mein concise (chote) jawab dein."
+                }
+            )
+            if response.text:
+                await msg.reply_text(response.text)
+        except Exception as e:
+            print(f"Gemini AI Error: {e}")
+            await msg.reply_text("Thoda technical issue aa gaya hai, kripya 1 minute baad try karein!")
+
+# -------------------------------------------------------------
+# 3. LINK PROTECTOR & MESSAGE FILTER
 # -------------------------------------------------------------
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -102,10 +164,25 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat.id
     user_id = msg.from_user.id
 
-    chat_member = await context.bot.get_chat_member(chat_id, user_id)
-    if chat_member.status in ["administrator", "creator"]:
-        return  # Admin Allowed
+    # Check for AI Trigger First
+    bot_username = context.bot.username
+    is_ai_trigger = (f"@{bot_username}" in msg.text) or (
+        msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id
+    )
 
+    if is_ai_trigger:
+        await handle_ai_chat(update, context)
+        return
+
+    # Check for Group Admins (Exempt from link deletion)
+    try:
+        chat_member = await context.bot.get_chat_member(chat_id, user_id)
+        if chat_member.status in ["administrator", "creator"]:
+            return
+    except Exception:
+        pass
+
+    # Link Auto-Deletion System
     if re.search(URL_REGEX, msg.text):
         log_text = (
             f"⚠️ **Link Deleted Alert**\n"
@@ -114,7 +191,10 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 **Message Content:**\n{msg.text}"
         )
         if LOG_GROUP_ID != 0:
-            await context.bot.send_message(chat_id=LOG_GROUP_ID, text=log_text, parse_mode="Markdown")
+            try:
+                await context.bot.send_message(chat_id=LOG_GROUP_ID, text=log_text, parse_mode="Markdown")
+            except Exception as e:
+                print(f"Log group error: {e}")
 
         try:
             await msg.delete()
@@ -122,7 +202,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Delete Error: {e}")
 
 # -------------------------------------------------------------
-# 3. SOURCE TO TARGET AUTOMATED MEDIA CRON
+# 4. MULTI-GROUP MEDIA AUTOMATION CRON
 # -------------------------------------------------------------
 async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -137,24 +217,31 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
-    if TARGET_GROUP_ID == 0:
+    target_group_ids = get_target_group_ids()
+    if not target_group_ids:
         return
 
-    unsent_media = list(media_col.find({"sent": False}).limit(20))
+    unsent_media = list(media_col.find({"sent": False}).limit(10))
     for media in unsent_media:
         try:
-            if media['type'] == 'photo':
-                await context.bot.send_photo(chat_id=TARGET_GROUP_ID, photo=media['media_id'])
-            elif media['type'] == 'video':
-                await context.bot.send_video(chat_id=TARGET_GROUP_ID, video=media['media_id'])
-            
+            for target_id in target_group_ids:
+                try:
+                    if media['type'] == 'photo':
+                        await context.bot.send_photo(chat_id=target_id, photo=media['media_id'])
+                    elif media['type'] == 'video':
+                        await context.bot.send_video(chat_id=target_id, video=media['media_id'])
+                    await asyncio.sleep(1)  # Gap to avoid Telegram flood limits
+                except Exception as group_err:
+                    print(f"Error posting to group {target_id}: {group_err}")
+
+            # Mark sent after attempting all target groups
             media_col.update_one({"_id": media["_id"]}, {"$set": {"sent": True}})
             await asyncio.sleep(3)
         except Exception as e:
-            print(f"Media post error: {e}")
+            print(f"Media loop error: {e}")
 
 # -------------------------------------------------------------
-# 4. IN-BOT DASHBOARD & DUAL BROADCAST SYSTEM
+# 5. ADMIN DASHBOARD & BROADCAST SYSTEM
 # -------------------------------------------------------------
 async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -163,17 +250,20 @@ async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dm_users = users_col.count_documents({})
     joins_data = stats_col.find_one({"_id": "total_joins"}) or {"count": 0}
     media_pending = media_col.count_documents({"sent": False})
+    targets = get_target_group_ids()
 
     text = (
         f"📊 **ADMIN DASHBOARD**\n\n"
-        f"👥 **Total Joins (Group):** `{joins_data['count']}`\n"
-        f"💬 **Registered DM Users (For Broadcast):** `{dm_users}`\n"
+        f"👥 **Total Group Joins:** `{joins_data['count']}`\n"
+        f"💬 **Registered DM Users:** `{dm_users}`\n"
+        f"🎯 **Target Groups Connected:** `{len(targets)}`\n"
         f"🖼️ **Pending Unsent Media:** `{media_pending}`\n"
+        f"🤖 **Gemini AI Status:** `{'Active ✅' if ai_client else 'Inactive ❌'}`\n"
     )
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Broadcast Users (DM)", callback_data="bc_users")],
-        [InlineKeyboardButton("📢 Broadcast Target Group", callback_data="bc_group")]
+        [InlineKeyboardButton("📢 Broadcast Target Groups", callback_data="bc_group")]
     ])
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
@@ -183,9 +273,9 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     if query.data == "bc_users":
-        await query.message.reply_text("Direct Broadcast ke liye likhein:\n`/send_users Aapka Message`", parse_mode="Markdown")
+        await query.message.reply_text("DM Broadcast ke liye likhein:\n`/send_users Aapka Message`", parse_mode="Markdown")
     elif query.data == "bc_group":
-        await query.message.reply_text("Group Broadcast ke liye likhein:\n`/send_group Aapka Message`", parse_mode="Markdown")
+        await query.message.reply_text("Multi-Group Broadcast ke liye likhein:\n`/send_group Aapka Message`", parse_mode="Markdown")
 
 async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -205,7 +295,7 @@ async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.05)
         except Exception:
             pass
-    await update.message.reply_text(f"✅ Successful DM Broadcast: {count} users.")
+    await update.message.reply_text(f"✅ DM Broadcast sent to {count} users.")
 
 async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -213,31 +303,37 @@ async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = " ".join(context.args)
     if not text:
-        await update.message.reply_text("Usage: `/send_group Hello Group!`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/send_group Hello Groups!`", parse_mode="Markdown")
         return
 
-    try:
-        await context.bot.send_message(chat_id=TARGET_GROUP_ID, text=text)
-        await update.message.reply_text("✅ Target Group Broadcast Sent!")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+    targets = get_target_group_ids()
+    sent_count = 0
+    for target_id in targets:
+        try:
+            await context.bot.send_message(chat_id=target_id, text=text)
+            sent_count += 1
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Broadcast error for group {target_id}: {e}")
+
+    await update.message.reply_text(f"✅ Broadcast sent to {sent_count}/{len(targets)} Target Groups!")
 
 # -------------------------------------------------------------
-# MAIN BOOTSTRAP (Bot On Main Thread, Flask On Background Thread)
+# MAIN BOOTSTRAP
 # -------------------------------------------------------------
 def main():
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN missing!")
         return
 
-    # 1. Flask Web Server ko Background Thread mein chalao (Render Port Binding ke liye)
+    # 1. Start Flask Server in Background Thread
     threading.Thread(target=run_flask_in_background, daemon=True).start()
     print("🌐 Background Flask Server Started!")
 
-    # 2. Telegram Bot ko MAIN THREAD par chalao
+    # 2. Build Telegram Bot Application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
+    # Register Command Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("dashboard", admin_dashboard))
     app.add_handler(CommandHandler("send_users", broadcast_users))
@@ -249,13 +345,11 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
 
-    # Job Queue
+    # Job Queue (Cron - Every 5 minutes / 300 seconds)
     if app.job_queue:
-        app.job_queue.run_repeating(auto_post_media_job, interval=86400, first=10)
+        app.job_queue.run_repeating(auto_post_media_job, interval=300, first=10)
 
     print("🤖 Telegram Bot Polling Started Successfully On Main Thread!")
-    
-    # Direct Polling on Main Thread (No signal errors!)
     app.run_polling(allowed_updates=["chat_member", "message", "callback_query"], stop_signals=None)
 
 if __name__ == '__main__':
