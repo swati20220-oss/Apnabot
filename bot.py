@@ -3,6 +3,7 @@ import re
 import asyncio
 import threading
 from datetime import datetime
+from functools import wraps
 from flask import Flask
 from google import genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -49,9 +50,10 @@ db = client['telegram_bot_db']
 users_col = db['users']
 media_col = db['media_logs']
 stats_col = db['stats']
+admin_rights_col = db['admin_rights']  # NEW: Custom Admin Rights Collection
 
-# RegEx Patterns
-URL_REGEX = r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+)'
+# Broad RegEx Pattern (SABHI TERAH KI LINKS & DOMAINS KO CATCH KARNE KE LIYE)
+ALL_URL_REGEX = r'((https?://|www\.)[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[^\s]*)?|t\.me/[^\s]+|telegram\.me/[^\s]+)'
 
 # Helper Functions for Multi-Group Parsing
 def get_source_group_ids():
@@ -67,7 +69,41 @@ def get_target_group_ids():
     return [int(x.strip()) for x in raw.split(",") if x.strip() and x.strip().replace('-', '').isdigit()]
 
 # -------------------------------------------------------------
-# 1. WELCOME & USER REGISTRATION
+# BOT-LEVEL PERMISSION HELPER & DECORATOR (RBAC SYSTEM)
+# -------------------------------------------------------------
+async def check_user_right(user_id: int, required_right: str) -> bool:
+    """Check if the user is Main Admin OR has the specific granted right in DB."""
+    if user_id == ADMIN_ID:
+        return True
+    
+    user_permissions = admin_rights_col.find_one({"user_id": user_id})
+    if user_permissions and user_permissions.get("rights", {}).get(required_right, False):
+        return True
+    
+    return False
+
+def require_permission(required_right: str):
+    """Decorator to restrict command execution based on dynamic bot rights."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            user = update.effective_user
+            if not user:
+                return
+            
+            has_access = await check_user_right(user.id, required_right)
+            if not has_access:
+                await update.effective_message.reply_text(
+                    f"❌ **Access Denied!** Aapke paas `{required_right}` right nahi hai is command ko chalane ke liye.",
+                    parse_mode="Markdown"
+                )
+                return
+            return await func(update, context, *args, **kwargs)
+        return wrapper
+    return decorator
+
+# -------------------------------------------------------------
+# 1. WELCOME & USER REGISTRATION (WITH DEEP LINKING GROUP ADD)
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -77,9 +113,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$set": {"user_id": user.id, "name": user.full_name, "joined_at": datetime.utcnow()}},
             upsert=True
         )
+    
+    bot_username = context.bot.username
+    deep_link_add_url = f"https://t.me/{bot_username}?startgroup=true"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="➕ Add Me To Your Group", url=deep_link_add_url)],
+        [InlineKeyboardButton(text="🔗 Official Community", url=WELCOME_LINK)]
+    ])
+    
     await update.message.reply_text(
-        f"Namaste {user.first_name}! Main aapka Group Manager & Gemini AI Assistant Bot hoon.\n"
-        f"Aap bot database mein successfully registered hain!"
+        f"Namaste {user.first_name}! Main aapka Group Manager & Gemini AI Assistant Bot hoon.\n\n"
+        f"✅ Aap bot database mein successfully registered hain!\n"
+        f"👇 Niche button par click karke mujhe apne kisi bhi group mein add karein:",
+        reply_markup=keyboard
     )
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,7 +152,61 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 # -------------------------------------------------------------
-# 2. GEMINI AI AUTO-REPLY SYSTEM (Sawaal Jawab)
+# 2. BOT-LEVEL DYNAMIC RIGHTS MANAGEMENT (GRANT & REVOKE)
+# -------------------------------------------------------------
+async def grant_right(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Sirf Bot Main Owner is command ko use kar sakta hai!")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ **Usage:** `/grant_right <USER_ID> <RIGHT_NAME>`\n\n"
+            "**Available Rights:**\n"
+            "• `broadcast` (Can send /send_users & /send_group)\n"
+            "• `promote` (Can execute Telegram /promote & /add)\n"
+            "• `dashboard` (Can view /dashboard)",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        right_name = context.args[1].lower()
+
+        admin_rights_col.update_one(
+            {"user_id": target_user_id},
+            {"$set": {f"rights.{right_name}": True, "updated_at": datetime.utcnow()}},
+            upsert=True
+        )
+        await update.message.reply_text(f"✅ User `{target_user_id}` ko `{right_name}` right de diya gaya hai!", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid User ID!")
+
+async def revoke_right(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Sirf Bot Main Owner is command ko use kar sakta hai!")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("⚠️ **Usage:** `/revoke_right <USER_ID> <RIGHT_NAME>`", parse_mode="Markdown")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        right_name = context.args[1].lower()
+
+        admin_rights_col.update_one(
+            {"user_id": target_user_id},
+            {"$set": {f"rights.{right_name}": False, "updated_at": datetime.utcnow()}},
+            upsert=True
+        )
+        await update.message.reply_text(f"🚫 User `{target_user_id}` se `{right_name}` right wapas le liya gaya hai!", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid User ID!")
+
+# -------------------------------------------------------------
+# 3. GEMINI AI AUTO-REPLY SYSTEM
 # -------------------------------------------------------------
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -145,20 +246,19 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Kuch technical issue aa gaya, thodi der baad try karein!")
 
 # -------------------------------------------------------------
-# 3. ADVANCED ADMIN ACTIONS (Make Admin & Add Member)
+# 4. ADVANCED ADMIN ACTIONS (Make Admin & Add Member)
 # -------------------------------------------------------------
+@require_permission("promote")
 async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     chat = update.effective_chat
     user = update.effective_user
 
-    # Admin verification
     member = await chat.get_member(user.id)
     if member.status not in ["administrator", "creator"]:
-        await msg.reply_text("⚠️ Ye command sirf Admins use kar sakte hain!")
+        await msg.reply_text("⚠️ Ye command sirf Group Admins use kar sakte hain!")
         return
 
-    # Check if replied to a user
     if not msg.reply_to_message:
         await msg.reply_text("Usage: Jis user ko Admin banana hai uske message par **reply** karke `/promote` likhein.", parse_mode="Markdown")
         return
@@ -179,6 +279,7 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.reply_text(f"❌ Admin banane mein error: {e}\n(Dhyaan rahe bot ke paas 'Add New Admins' right hona chahiye).")
 
+@require_permission("promote")
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     chat = update.effective_chat
@@ -195,16 +296,19 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ User add nahi ho saka: {e}\n(User ki privacy settings block kar sakti hain).")
 
 # -------------------------------------------------------------
-# 4. LINK PROTECTION & HANDLERS
+# 5. ALL LINKS ERASER & LOG FORWARDING HANDLER
 # -------------------------------------------------------------
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
         return
 
-    chat_id = msg.chat.id
+    chat = update.effective_chat
+    chat_id = chat.id
+    chat_title = chat.title or "Unknown Group"
     user_id = msg.from_user.id
 
+    # 1. AI Trigger Check (@Bot Tag or Reply)
     bot_username = context.bot.username
     is_ai_trigger = (f"@{bot_username}" in msg.text) or (
         msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id
@@ -214,6 +318,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_ai_chat(update, context)
         return
 
+    # 2. Check Admin Status (Admins can send links)
     try:
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
         if chat_member.status in ["administrator", "creator"]:
@@ -221,20 +326,36 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    if re.search(URL_REGEX, msg.text):
+    # 3. ALL LINKS Detection Logic
+    if re.search(ALL_URL_REGEX, msg.text, re.IGNORECASE):
         if LOG_GROUP_ID != 0:
-            log_text = f"⚠️ **Link Deleted**\n👤 User: {msg.from_user.full_name} (`{user_id}`)\n📝 Text: {msg.text}"
             try:
-                await context.bot.send_message(chat_id=LOG_GROUP_ID, text=log_text, parse_mode="Markdown")
-            except Exception:
-                pass
+                # Step A: Original Message Forward
+                await context.bot.forward_message(
+                    chat_id=LOG_GROUP_ID,
+                    from_chat_id=chat_id,
+                    message_id=msg.message_id
+                )
+                
+                # Step B: Detailed Log with Group Name & ID
+                log_info = (
+                    f"⚠️ **Deleted Link Alert**\n\n"
+                    f"📢 **Group Name:** `{chat_title}`\n"
+                    f"📍 **Group ID:** `{chat_id}`\n"
+                    f"👤 **User:** {msg.from_user.full_name} (`{user_id}`)"
+                )
+                await context.bot.send_message(chat_id=LOG_GROUP_ID, text=log_info, parse_mode="Markdown")
+            except Exception as log_err:
+                print(f"Log forwarding error: {log_err}")
+
+        # Step C: Delete message from group
         try:
             await msg.delete()
-        except Exception:
-            pass
+        except Exception as del_err:
+            print(f"Delete Error: {del_err}")
 
 # -------------------------------------------------------------
-# 5. MULTI-SOURCE TO MULTI-TARGET MEDIA CRON
+# 6. MULTI-SOURCE TO MULTI-TARGET MEDIA CRON
 # -------------------------------------------------------------
 async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -274,12 +395,10 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
             print(f"Cron Error: {e}")
 
 # -------------------------------------------------------------
-# 6. DASHBOARD & BROADCAST
+# 7. DASHBOARD & BROADCAST SYSTEM
 # -------------------------------------------------------------
+@require_permission("dashboard")
 async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
     dm_users = users_col.count_documents({})
     joins_data = stats_col.find_one({"_id": "total_joins"}) or {"count": 0}
     media_pending = media_col.count_documents({"sent": False})
@@ -310,9 +429,8 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     elif query.data == "bc_group":
         await query.message.reply_text("Group Broadcast: `/send_group Message`", parse_mode="Markdown")
 
+@require_permission("broadcast")
 async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
     text = " ".join(context.args)
     if not text:
         await update.message.reply_text("Usage: `/send_users Text`", parse_mode="Markdown")
@@ -329,9 +447,8 @@ async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     await update.message.reply_text(f"✅ Sent to {count} DM users.")
 
+@require_permission("broadcast")
 async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
     text = " ".join(context.args)
     if not text:
         await update.message.reply_text("Usage: `/send_group Text`", parse_mode="Markdown")
@@ -369,6 +486,8 @@ def main():
     app.add_handler(CommandHandler("send_group", broadcast_group))
     app.add_handler(CommandHandler("promote", promote_user))
     app.add_handler(CommandHandler("add", add_user))
+    app.add_handler(CommandHandler("grant_right", grant_right))
+    app.add_handler(CommandHandler("revoke_right", revoke_right))
     app.add_handler(CallbackQueryHandler(button_click_handler))
     
     # Events
