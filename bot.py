@@ -116,28 +116,43 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Aap database mein registered hain!"
     )
 
+# Fixed Welcome Handler (Detects both ChatMember updates & Message new_chat_members)
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = update.chat_member
-    if result.old_chat_member.status in ["left", "kicked"] and result.new_chat_member.status == "member":
-        user = result.new_chat_member.user
+    user = None
+    chat_id = update.effective_chat.id
+
+    if update.chat_member:
+        result = update.chat_member
+        if result.old_chat_member.status in ["left", "kicked"] and result.new_chat_member.status in ["member", "administrator"]:
+            user = result.new_chat_member.user
+    elif update.message and update.message.new_chat_members:
+        for new_user in update.message.new_chat_members:
+            if not new_user.is_bot:
+                user = new_user
+                break
+
+    if user:
         if stats_col is not None:
             stats_col.update_one({"_id": "total_joins"}, {"$inc": {"count": 1}}, upsert=True)
 
         user_mention = f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
         welcome_text = (
             f"Aapka swagat hai {user_mention}! 🎉\n\n"
-            f"Group rules follow karein aur niche button par click karke bot ko DM mein START karein!"
+            f"Group rules follow karein aur niche button par click karke official channel join karein aur bot start karein!"
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(text="🔗 Official Link", url=WELCOME_LINK)],
             [InlineKeyboardButton(text="🤖 Bot Ko Start Karein", url=f"https://t.me/{context.bot.username}?start=welcome")]
         ])
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=welcome_text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=welcome_text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            print(f"Welcome Message Error: {e}")
 
 # -------------------------------------------------------------
 # 2. GEMINI AI AUTO-REPLY SYSTEM
@@ -320,6 +335,7 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.reply_text(f"❌ Promote Error: {e}")
 
+# Fixed /add Function (Generates Invite Link instead of crashing)
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     perms = get_admin_permissions(user_id)
@@ -327,15 +343,19 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Aapke paas Members Add karne ki permission nahi hai!")
         return
 
-    if not context.args:
-        await update.message.reply_text("Usage: `/add @username` ya `/add USER_ID`", parse_mode="Markdown")
-        return
-
+    chat_id = update.effective_chat.id
     try:
-        await context.bot.add_chat_members(chat_id=update.effective_chat.id, user_ids=[context.args[0]])
-        await update.message.reply_text(f"✅ User {context.args[0]} add ho gaya!")
+        invite_link = await context.bot.create_chat_invite_link(
+            chat_id=chat_id,
+            member_limit=1
+        )
+        await update.message.reply_text(
+            f"🔗 **Group Invite Link Generated:**\n{invite_link.invite_link}\n\n"
+            f"Telegram API rules ki wajah se bot direct user add nahi kar sakta. Aap yeh link user ko bhej kar join karwa sakte hain!",
+            parse_mode="Markdown"
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Add Error: {e}")
+        await update.message.reply_text(f"❌ Error generating invite link: {e}")
 
 async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -507,8 +527,11 @@ def main():
     app.add_handler(CommandHandler("add", add_user))
     app.add_handler(CallbackQueryHandler(button_click_handler))
     
-    # Events & Handlers
+    # Dual Welcome Handlers (Support both ChatMember events and standard New Chat Member messages)
     app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+
+    # Event Handlers
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
 
