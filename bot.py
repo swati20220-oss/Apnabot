@@ -19,7 +19,7 @@ from telegram.ext import (
 from pymongo import MongoClient
 
 # -------------------------------------------------------------
-# 1. FLASK KEEP-ALIVE SERVER (Port 8099 / Render)
+# 1. FLASK KEEP-ALIVE SERVER (Port 8099 / Render / Replit)
 # -------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -40,29 +40,30 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WELCOME_LINK = os.getenv("WELCOME_LINK", "https://t.me")
 INITIAL_ADMIN = os.getenv("ADMIN_ID", "0")
 
-# Gemini AI Client
+# Gemini AI Client Init
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # MongoDB Connection
 client = MongoClient(MONGO_URI)
 db = client['telegram_bot_db']
 
-# Collections
+# Database Collections
 users_col = db['users']
 media_col = db['media_logs']
 stats_col = db['stats']
 config_col = db['bot_config']
 badwords_col = db['badwords']
+admin_perms_col = db['admin_permissions']
 
-# Initial DB Config Setup
+# Initial DB Config Setup for Initial Admin/Owner
 if INITIAL_ADMIN != "0" and INITIAL_ADMIN.replace('-', '').isdigit():
     config_col.update_one({"_id": "owners"}, {"$addToSet": {"ids": int(INITIAL_ADMIN)}}, upsert=True)
 
-# Regex Patterns
+# Regex Pattern for ALL URLs & Links
 ALL_URL_REGEX = r'((https?://|www\.)[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[^\s]*)?|t\.me/[^\s]+|telegram\.me/[^\s]+)'
 
 # -------------------------------------------------------------
-# 3. HELPER FUNCTIONS FOR DYNAMIC DB CONFIGURATION
+# 3. HELPER FUNCTIONS FOR DYNAMIC CONFIGURATION
 # -------------------------------------------------------------
 def get_db_ids(config_key):
     doc = config_col.find_one({"_id": config_key})
@@ -82,8 +83,16 @@ def get_custom_caption():
     doc = config_col.find_one({"_id": "branding_caption"})
     return doc.get("text", "") if doc else ""
 
+def has_admin_permission(user_id, perm_name):
+    if is_owner(user_id):
+        return True
+    perm_doc = admin_perms_col.find_one({"user_id": user_id})
+    if perm_doc and perm_doc.get("permissions", {}).get(perm_name, False):
+        return True
+    return False
+
 # -------------------------------------------------------------
-# 4. WELCOME & DM REGISTRATION
+# 4. WELCOME & USER REGISTRATION SYSTEM
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -94,7 +103,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upsert=True
         )
     await update.message.reply_text(
-        f"Namaste {user.first_name}! Main aapka Dynamic Group Manager & Gemini AI Assistant Bot hoon.\n"
+        f"Namaste {user.first_name}! Main aapka Dynamic Telegram Group Manager & Gemini AI Assistant Bot hoon.\n\n"
         f"Aap bot database mein successfully registered hain!"
     )
 
@@ -151,7 +160,7 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model="gemini-2.5-flash",
                 contents=prompt,
                 config={
-                    "system_instruction": "Aap ek friendly, smart aur helpful Telegram Assistant hain. Concise Hinglish mein jawab dein."
+                    "system_instruction": "Aap ek friendly, smart aur helpful Telegram Assistant hain. Concise aur clear Hinglish mein answer dein."
                 }
             )
             if response.text:
@@ -161,18 +170,112 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Kuch technical issue aa gaya, thodi der baad try karein!")
 
 # -------------------------------------------------------------
-# 6. DYNAMIC LIVE GROUP & OWNER MANAGEMENT COMMANDS
+# 6. ADVANCED ADMIN CONTROL COMMANDS
+# -------------------------------------------------------------
+async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not has_admin_permission(user.id, "can_promote"):
+        await msg.reply_text("⛔ Access Denied! Aapke paas `can_promote` permission nahi hai.")
+        return
+
+    if not msg.reply_to_message and not context.args:
+        await msg.reply_text("Usage: Reply to message with `/promote` OR `/promote <user_id>`", parse_mode="Markdown")
+        return
+
+    target_user_id = msg.reply_to_message.from_user.id if msg.reply_to_message else int(context.args[0])
+    try:
+        await context.bot.promote_chat_member(
+            chat_id=chat.id,
+            user_id=target_user_id,
+            can_change_info=True,
+            can_delete_messages=True,
+            can_invite_users=True,
+            can_restrict_members=True,
+            can_pin_messages=True,
+            can_promote_members=False
+        )
+        admin_perms_col.update_one(
+            {"user_id": target_user_id},
+            {"$set": {"is_admin": True, "promoted_at": datetime.utcnow()}},
+            upsert=True
+        )
+        await msg.reply_text(f"✅ User `{target_user_id}` ko Admin bana diya gaya hai!", parse_mode="Markdown")
+    except Exception as e:
+        await msg.reply_text(f"❌ Promote Error: {e}")
+
+async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not is_owner(user.id):
+        await msg.reply_text("⛔ Sirf Bot Owner hi kisi ko demote kar sakta hai!")
+        return
+
+    if not msg.reply_to_message and not context.args:
+        await msg.reply_text("Usage: Reply with `/demote` OR `/demote <user_id>`", parse_mode="Markdown")
+        return
+
+    target_user_id = msg.reply_to_message.from_user.id if msg.reply_to_message else int(context.args[0])
+    try:
+        await context.bot.promote_chat_member(
+            chat_id=chat.id,
+            user_id=target_user_id,
+            can_change_info=False,
+            can_delete_messages=False,
+            can_invite_users=False,
+            can_restrict_members=False,
+            can_pin_messages=False,
+            can_promote_members=False
+        )
+        admin_perms_col.delete_one({"user_id": target_user_id})
+        await msg.reply_text(f"✅ User `{target_user_id}` ko Demote kar diya gaya hai!", parse_mode="Markdown")
+    except Exception as e:
+        await msg.reply_text(f"❌ Demote Error: {e}")
+
+async def set_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await msg.reply_text("⛔ Sirf Owner permissions set kar sakta hai!")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: `/set_perm <user_id> <permission_name> true/false`", parse_mode="Markdown")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        perm_name = context.args[1].lower()
+        val = context.args[2].lower() == "true"
+
+        admin_perms_col.update_one(
+            {"user_id": target_id},
+            {"$set": {f"permissions.{perm_name}": val}},
+            upsert=True
+        )
+        await update.message.reply_text(f"✅ Permission `{perm_name}` = `{val}` set for `{target_id}`", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error setting permission: {e}")
+
+# -------------------------------------------------------------
+# 7. DYNAMIC LIVE GROUP & OWNER CONFIGURATION
 # -------------------------------------------------------------
 async def list_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
     
+    badwords_doc = badwords_col.find_one({"_id": "word_list"})
+    words = badwords_doc.get("words", []) if badwords_doc else []
+
     text = (
         f"📋 **DYNAMIC BOT CONFIGURATION**\n\n"
         f"👑 **Owners:** `{get_db_ids('owners')}`\n"
         f"📥 **Source Groups:** `{get_db_ids('source_groups')}`\n"
         f"📤 **Target Groups:** `{get_db_ids('target_groups')}`\n"
         f"📢 **Log Groups:** `{get_db_ids('log_groups')}`\n"
+        f"🚫 **Badwords List:** `{words}`\n"
         f"🏷️ **Branding Caption:** `{get_custom_caption() or 'Not Set'}`\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -189,7 +292,7 @@ async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid ID! Integer/Numeric ID dein.")
+        await update.message.reply_text("❌ Invalid ID! Enter a numeric ID.")
         return
 
     mapping = {
@@ -212,7 +315,7 @@ async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"✅ {msg_text}: `{target_id}`", parse_mode="Markdown")
 
 # -------------------------------------------------------------
-# 7. KEYWORD BADWORD FILTER & BRANDING CAPTION COMMANDS
+# 8. BADWORD FILTER & BRANDING CAPTION COMMANDS
 # -------------------------------------------------------------
 async def add_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -241,11 +344,11 @@ async def set_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     caption_text = " ".join(context.args)
     if not caption_text:
-        await update.message.reply_text("Usage: `/set_caption <Your Branding Text/Links>`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/set_caption <Your Text/Links>`", parse_mode="Markdown")
         return
 
     config_col.update_one({"_id": "branding_caption"}, {"$set": {"text": caption_text}}, upsert=True)
-    await update.message.reply_text(f"✅ Custom Media Caption Updated:\n\n{caption_text}")
+    await update.message.reply_text(f"✅ Custom Caption Set:\n\n{caption_text}")
 
 async def reset_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -254,7 +357,7 @@ async def reset_caption_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("✅ Custom Caption Reset To Default.")
 
 # -------------------------------------------------------------
-# 8. LINK & BADWORD ERASER + LOG FORWARDING
+# 9. ALL LINKS & BADWORD ERASER + MULTI-LOG FORWARDING
 # -------------------------------------------------------------
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -266,7 +369,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_title = chat.title or "Unknown Group"
     user_id = msg.from_user.id
 
-    # AI Trigger Check
+    # 1. Gemini AI Trigger Check
     bot_username = context.bot.username
     is_ai_trigger = (f"@{bot_username}" in msg.text) or (
         msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id
@@ -276,7 +379,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_ai_chat(update, context)
         return
 
-    # Admin Check
+    # 2. Admin Status Check
     try:
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
         if chat_member.status in ["administrator", "creator"] or is_owner(user_id):
@@ -284,7 +387,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Check Badwords List
+    # 3. Check Badwords & Links
     badwords_doc = badwords_col.find_one({"_id": "word_list"})
     badwords = badwords_doc.get("words", []) if badwords_doc else []
     
@@ -292,11 +395,12 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_link = bool(re.search(ALL_URL_REGEX, msg.text, re.IGNORECASE))
 
     if has_link or has_badword:
-        reason = "Promotional Link" if has_link else "Abusive/Blocked Word"
+        reason = "Promotional Link" if has_link else "Blocked/Abusive Word"
         log_ids = get_db_ids("log_groups")
         
         for log_id in log_ids:
             try:
+                # Forward original msg to Log Channel
                 await context.bot.forward_message(
                     chat_id=log_id,
                     from_chat_id=chat_id,
@@ -304,7 +408,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 log_info = (
                     f"⚠️ **Deleted Message Alert ({reason})**\n\n"
-                    f"📢 **Group Name:** `{chat_title}`\n"
+                    f"📢 **Group:** `{chat_title}`\n"
                     f"📍 **Group ID:** `{chat_id}`\n"
                     f"👤 **User:** {msg.from_user.full_name} (`{user_id}`)"
                 )
@@ -318,7 +422,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Delete Error: {del_err}")
 
 # -------------------------------------------------------------
-# 9. MULTI-SOURCE MEDIA FETCHING & ANTI-DUPLICATE HASHING
+# 10. MULTI-SOURCE MEDIA FETCHING & ANTI-DUPLICATE HASHING
 # -------------------------------------------------------------
 async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -328,10 +432,9 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
         media_id = msg.photo[-1].file_id if msg.photo else msg.video.file_id
         media_type = "photo" if msg.photo else "video"
         
-        # Anti-Duplicate Unique Media Hash Generation
+        # Anti-Duplicate Unique Hash
         unique_hash = hashlib.md5(f"{media_type}_{media_id[-20:]}".encode()).hexdigest()
 
-        # Check if Duplicate
         if media_col.find_one({"hash": unique_hash}):
             return
 
@@ -365,7 +468,7 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_video(chat_id=target_id, video=media['media_id'], caption=custom_caption)
                     await asyncio.sleep(1)
                 except Exception as group_err:
-                    print(f"Error Target {target_id}: {group_err}")
+                    print(f"Target Error {target_id}: {group_err}")
 
             media_col.update_one({"_id": media["_id"]}, {"$set": {"sent": True}})
             await asyncio.sleep(3)
@@ -373,7 +476,7 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
             print(f"Cron Error: {e}")
 
 # -------------------------------------------------------------
-# 10. STATS & BROADCAST SYSTEM
+# 11. STATS, DASHBOARD & BROADCAST SYSTEM
 # -------------------------------------------------------------
 async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -385,15 +488,15 @@ async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     media_pending = media_col.count_documents({"sent": False})
 
     text = (
-        f"📊 **BOT SYSTEM DASHBOARD**\n\n"
-        f"👑 **Owners:** `{len(get_db_ids('owners'))}`\n"
+        f"📊 **BOT SYSTEM DASHBOARD & STATS**\n\n"
+        f"👑 **Owners Active:** `{len(get_db_ids('owners'))}`\n"
         f"👥 **Total Group Joins:** `{joins_data['count']}`\n"
         f"💬 **Registered DM Users:** `{dm_users}`\n"
         f"📢 **Log Groups:** `{len(get_db_ids('log_groups'))}`\n"
         f"📥 **Source Groups:** `{len(get_db_ids('source_groups'))}`\n"
         f"📤 **Target Groups:** `{len(get_db_ids('target_groups'))}`\n"
-        f"🖼️ **Pending Unsent Media:** `{media_pending}`\n"
-        f"🤖 **Gemini AI:** `{'Active ✅' if ai_client else 'Inactive ❌'}`\n"
+        f"🖼️ **Pending Media Jobs:** `{media_pending}`\n"
+        f"🤖 **Gemini AI Status:** `{'Active ✅' if ai_client else 'Inactive ❌'}`\n"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Broadcast Users (DM)", callback_data="bc_users")],
@@ -450,7 +553,7 @@ async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {sent_count}/{len(targets)} Target Groups!")
 
 # -------------------------------------------------------------
-# MAIN BOOTSTRAP
+# MAIN APPLICATION BOOTSTRAP
 # -------------------------------------------------------------
 def main():
     if not BOT_TOKEN:
@@ -461,6 +564,11 @@ def main():
     print("🌐 Background Flask Server Started (Port 8099)!")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Admin Control Commands
+    app.add_handler(CommandHandler("promote", promote_user))
+    app.add_handler(CommandHandler("demote", demote_user))
+    app.add_handler(CommandHandler("set_perm", set_permission))
 
     # Dynamic Management Commands
     app.add_handler(CommandHandler("list_groups", list_groups_command))
@@ -473,7 +581,7 @@ def main():
     app.add_handler(CommandHandler("set_caption", set_caption_command))
     app.add_handler(CommandHandler("reset_caption", reset_caption_command))
 
-    # Admin & Dashboard Commands
+    # General & Stats Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stats", admin_dashboard))
     app.add_handler(CommandHandler("dashboard", admin_dashboard))
@@ -486,7 +594,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
 
-    # Job Queue (Every 5 mins)
+    # Job Queue Scheduler (Every 5 mins)
     if app.job_queue:
         app.job_queue.run_repeating(auto_post_media_job, interval=300, first=10)
 
