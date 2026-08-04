@@ -601,5 +601,81 @@ def main():
     print("🤖 Telegram Bot Polling Started!")
     app.run_polling(allowed_updates=["chat_member", "message", "callback_query"], stop_signals=None)
 
+# -------------------------------------------------------------
+# MAIN APPLICATION BOOTSTRAP (MENU BUTTON INTEGRATED)
+# -------------------------------------------------------------
+from telegram import BotCommand
+
+async def post_init(application: Application):
+    # Dynamic Menu Commands list
+    commands = [
+        BotCommand("start", "Bot ko start ya restart karein"),
+        BotCommand("list_groups", "Saari active groups aur config list karein"),
+        BotCommand("add_target", "Target Group add karein"),
+        BotCommand("del_target", "Target Group remove karein"),
+        BotCommand("add_source", "Source Group add karein"),
+        BotCommand("del_source", "Source Group remove karein"),
+        BotCommand("add_log", "Log Group add karein"),
+        BotCommand("del_log", "Log Group remove karein"),
+        BotCommand("add_owner", "Owner add karein"),
+        BotCommand("del_owner", "Owner remove karein"),
+        BotCommand("add_badword", "Word block karein"),
+        BotCommand("del_badword", "Word unblock karein"),
+        BotCommand("set_caption", "Custom Caption set karein"),
+        BotCommand("reset_caption", "Caption reset karein"),
+        BotCommand("stats", "Dashboard aur System Stats dekhein"),
+        BotCommand("promote", "Member ko Admin banaayein"),
+        BotCommand("demote", "Admin ko Demote karein"),
+    ]
+    await application.bot.set_my_commands(commands)
+    print("✅ Bot Menu Commands successfully set for all users!")
+
+def main():
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN missing!")
+        return
+
+    threading.Thread(target=run_flask_in_background, daemon=True).start()
+    print("🌐 Background Flask Server Started (Port 8099)!")
+
+    # post_init link ho gaya hai
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Admin Control Commands
+    app.add_handler(CommandHandler("promote", promote_user))
+    app.add_handler(CommandHandler("demote", demote_user))
+    app.add_handler(CommandHandler("set_perm", set_permission))
+
+    # Dynamic Management Commands
+    app.add_handler(CommandHandler("list_groups", list_groups_command))
+    for cmd in ["add_target", "del_target", "add_source", "del_source", "add_log", "del_log", "add_owner", "del_owner"]:
+        app.add_handler(CommandHandler(cmd, manage_dynamic_config))
+
+    # Branding & Filter Commands
+    app.add_handler(CommandHandler("add_badword", add_badword))
+    app.add_handler(CommandHandler("del_badword", del_badword))
+    app.add_handler(CommandHandler("set_caption", set_caption_command))
+    app.add_handler(CommandHandler("reset_caption", reset_caption_command))
+
+    # General & Stats Commands
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("stats", admin_dashboard))
+    app.add_handler(CommandHandler("dashboard", admin_dashboard))
+    app.add_handler(CommandHandler("send_users", broadcast_users))
+    app.add_handler(CommandHandler("send_group", broadcast_group))
+    app.add_handler(CallbackQueryHandler(button_click_handler))
+    
+    # Event Handlers
+    app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
+
+    # Job Queue Scheduler (Every 5 mins)
+    if app.job_queue:
+        app.job_queue.run_repeating(auto_post_media_job, interval=300, first=10)
+
+    print("🤖 Telegram Bot Polling Started!")
+    app.run_polling(allowed_updates=["chat_member", "message", "callback_query"], stop_signals=None)
+
 if __name__ == '__main__':
     main()
