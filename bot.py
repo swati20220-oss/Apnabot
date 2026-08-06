@@ -3,10 +3,10 @@ import re
 import asyncio
 import hashlib
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask
 from google import genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -99,7 +99,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user:
         users_col.update_one(
             {"user_id": user.id},
-            {"$set": {"user_id": user.id, "name": user.full_name, "joined_at": datetime.utcnow()}},
+            {"$set": {"user_id": user.id, "name": user.full_name, "joined_at": datetime.now(timezone.utc)}},
             upsert=True
         )
     await update.message.reply_text(
@@ -199,7 +199,7 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         admin_perms_col.update_one(
             {"user_id": target_user_id},
-            {"$set": {"is_admin": True, "promoted_at": datetime.utcnow()}},
+            {"$set": {"is_admin": True, "promoted_at": datetime.now(timezone.utc)}},
             upsert=True
         )
         await msg.reply_text(f"✅ User `{target_user_id}` ko Admin bana diya gaya hai!", parse_mode="Markdown")
@@ -237,12 +237,13 @@ async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ Demote Error: {e}")
 
 async def set_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
     if not is_owner(update.effective_user.id):
         await msg.reply_text("⛔ Sirf Owner permissions set kar sakta hai!")
         return
 
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: `/set_perm <user_id> <permission_name> true/false`", parse_mode="Markdown")
+        await msg.reply_text("Usage: `/set_perm <user_id> <permission_name> true/false`", parse_mode="Markdown")
         return
 
     try:
@@ -255,9 +256,9 @@ async def set_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$set": {f"permissions.{perm_name}": val}},
             upsert=True
         )
-        await update.message.reply_text(f"✅ Permission `{perm_name}` = `{val}` set for `{target_id}`", parse_mode="Markdown")
+        await msg.reply_text(f"✅ Permission `{perm_name}` = `{val}` set for `{target_id}`", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error setting permission: {e}")
+        await msg.reply_text(f"❌ Error setting permission: {e}")
 
 # -------------------------------------------------------------
 # 7. DYNAMIC LIVE GROUP & OWNER CONFIGURATION
@@ -445,7 +446,7 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "type": media_type, 
                 "hash": unique_hash, 
                 "sent": False, 
-                "added_at": datetime.utcnow()
+                "added_at": datetime.now(timezone.utc)
             }},
             upsert=True
         )
@@ -553,61 +554,9 @@ async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {sent_count}/{len(targets)} Target Groups!")
 
 # -------------------------------------------------------------
-# MAIN APPLICATION BOOTSTRAP
-# -------------------------------------------------------------
-def main():
-    if not BOT_TOKEN:
-        print("Error: BOT_TOKEN missing!")
-        return
-
-    threading.Thread(target=run_flask_in_background, daemon=True).start()
-    print("🌐 Background Flask Server Started (Port 8099)!")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Admin Control Commands
-    app.add_handler(CommandHandler("promote", promote_user))
-    app.add_handler(CommandHandler("demote", demote_user))
-    app.add_handler(CommandHandler("set_perm", set_permission))
-
-    # Dynamic Management Commands
-    app.add_handler(CommandHandler("list_groups", list_groups_command))
-    for cmd in ["add_target", "del_target", "add_source", "del_source", "add_log", "del_log", "add_owner", "del_owner"]:
-        app.add_handler(CommandHandler(cmd, manage_dynamic_config))
-
-    # Branding & Filter Commands
-    app.add_handler(CommandHandler("add_badword", add_badword))
-    app.add_handler(CommandHandler("del_badword", del_badword))
-    app.add_handler(CommandHandler("set_caption", set_caption_command))
-    app.add_handler(CommandHandler("reset_caption", reset_caption_command))
-
-    # General & Stats Commands
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", admin_dashboard))
-    app.add_handler(CommandHandler("dashboard", admin_dashboard))
-    app.add_handler(CommandHandler("send_users", broadcast_users))
-    app.add_handler(CommandHandler("send_group", broadcast_group))
-    app.add_handler(CallbackQueryHandler(button_click_handler))
-    
-    # Event Handlers
-    app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
-
-    # Job Queue Scheduler (Every 5 mins)
-    if app.job_queue:
-        app.job_queue.run_repeating(auto_post_media_job, interval=300, first=10)
-
-    print("🤖 Telegram Bot Polling Started!")
-    app.run_polling(allowed_updates=["chat_member", "message", "callback_query"], stop_signals=None)
-
-# -------------------------------------------------------------
 # MAIN APPLICATION BOOTSTRAP (MENU BUTTON INTEGRATED)
 # -------------------------------------------------------------
-from telegram import BotCommand
-
 async def post_init(application: Application):
-    # Dynamic Menu Commands list
     commands = [
         BotCommand("start", "Bot ko start ya restart karein"),
         BotCommand("list_groups", "Saari active groups aur config list karein"),
@@ -638,7 +587,6 @@ def main():
     threading.Thread(target=run_flask_in_background, daemon=True).start()
     print("🌐 Background Flask Server Started (Port 8099)!")
 
-    # post_init link ho gaya hai
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Admin Control Commands
