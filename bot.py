@@ -6,11 +6,17 @@ import threading
 from datetime import datetime, timezone
 from flask import Flask
 from google import genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    BotCommand, 
+    BotCommandScopeDefault, 
+    BotCommandScopeAllChatAdministrators
+)
 from telegram.ext import (
     Application,
     CommandHandler,
-    ChatMemberHandler,
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
@@ -63,7 +69,7 @@ if INITIAL_ADMIN != "0" and INITIAL_ADMIN.replace('-', '').isdigit():
 ALL_URL_REGEX = r'((https?://|www\.)[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[^\s]*)?|t\.me/[^\s]+|telegram\.me/[^\s]+)'
 
 # -------------------------------------------------------------
-# 3. HELPER FUNCTIONS FOR DYNAMIC CONFIGURATION
+# 3. HELPER FUNCTIONS FOR DYNAMIC CONFIGURATION & PERMISSIONS
 # -------------------------------------------------------------
 def get_db_ids(config_key):
     doc = config_col.find_one({"_id": config_key})
@@ -83,16 +89,16 @@ def get_custom_caption():
     doc = config_col.find_one({"_id": "branding_caption"})
     return doc.get("text", "") if doc else ""
 
-def has_admin_permission(user_id, perm_name):
+def can_run_command(user_id: int, required_perm: str) -> bool:
     if is_owner(user_id):
         return True
     perm_doc = admin_perms_col.find_one({"user_id": user_id})
-    if perm_doc and perm_doc.get("permissions", {}).get(perm_name, False):
+    if perm_doc and perm_doc.get("permissions", {}).get(required_perm, False):
         return True
     return False
 
 # -------------------------------------------------------------
-# 4. WELCOME & USER REGISTRATION SYSTEM
+# 4. WELCOME & USER REGISTRATION SYSTEM (FIXED EVENT)
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -108,12 +114,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = update.chat_member
-    if result.old_chat_member.status in ["left", "kicked"] and result.new_chat_member.status == "member":
-        user = result.new_chat_member.user
+    msg = update.message
+    if not msg or not msg.new_chat_members:
+        return
+
+    for new_member in msg.new_chat_members:
+        if new_member.id == context.bot.id:
+            continue
+
         stats_col.update_one({"_id": "total_joins"}, {"$inc": {"count": 1}}, upsert=True)
 
-        user_mention = f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
+        user_mention = f'<a href="tg://user?id={new_member.id}">{new_member.full_name}</a>'
         welcome_text = (
             f"Aapka swagat hai {user_mention}! 🎉\n\n"
             f"Group rules follow karein aur niche button par click karke bot ko DM mein START karein!"
@@ -122,12 +133,16 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton(text="🔗 Official Link", url=WELCOME_LINK)],
             [InlineKeyboardButton(text="🤖 Bot Ko Start Karein", url=f"https://t.me/{context.bot.username}?start=welcome")]
         ])
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=welcome_text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+
+        try:
+            await msg.reply_text(
+                text=welcome_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            print(f"Welcome Message Error: {e}")
 
 # -------------------------------------------------------------
 # 5. GEMINI AI AUTO-REPLY SYSTEM
@@ -177,7 +192,7 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
 
-    if not has_admin_permission(user.id, "can_promote"):
+    if not can_run_command(user.id, "can_promote"):
         await msg.reply_text("⛔ Access Denied! Aapke paas `can_promote` permission nahi hai.")
         return
 
@@ -211,8 +226,8 @@ async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
 
-    if not is_owner(user.id):
-        await msg.reply_text("⛔ Sirf Bot Owner hi kisi ko demote kar sakta hai!")
+    if not can_run_command(user.id, "can_demote"):
+        await msg.reply_text("⛔ Access Denied! Aapke paas `can_demote` permission nahi hai.")
         return
 
     if not msg.reply_to_message and not context.args:
@@ -264,7 +279,8 @@ async def set_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 7. DYNAMIC LIVE GROUP & OWNER CONFIGURATION
 # -------------------------------------------------------------
 async def list_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_config"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     
     badwords_doc = badwords_col.find_one({"_id": "word_list"})
@@ -282,10 +298,17 @@ async def list_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    cmd = update.message.text.split()[0].lower()
+
+    if cmd in ["/add_owner", "/del_owner"] and not is_owner(user_id):
+        await update.message.reply_text("⛔ Sirf Owner hi Owner add/remove kar sakta hai!")
         return
 
-    cmd = update.message.text.split()[0].lower()
+    if not can_run_command(user_id, "can_config"):
+        await update.message.reply_text("⛔ Access Denied!")
+        return
+
     if not context.args:
         await update.message.reply_text(f"Usage: `{cmd} <ID>`", parse_mode="Markdown")
         return
@@ -319,7 +342,8 @@ async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TY
 # 8. BADWORD FILTER & BRANDING CAPTION COMMANDS
 # -------------------------------------------------------------
 async def add_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_badwords"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     if not context.args:
         await update.message.reply_text("Usage: `/add_badword <word>`", parse_mode="Markdown")
@@ -330,7 +354,8 @@ async def add_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Badword added: `{word}`", parse_mode="Markdown")
 
 async def del_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_badwords"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     if not context.args:
         await update.message.reply_text("Usage: `/del_badword <word>`", parse_mode="Markdown")
@@ -341,7 +366,8 @@ async def del_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Badword removed: `{word}`", parse_mode="Markdown")
 
 async def set_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_caption"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     caption_text = " ".join(context.args)
     if not caption_text:
@@ -352,7 +378,8 @@ async def set_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"✅ Custom Caption Set:\n\n{caption_text}")
 
 async def reset_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_caption"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     config_col.delete_one({"_id": "branding_caption"})
     await update.message.reply_text("✅ Custom Caption Reset To Default.")
@@ -401,7 +428,6 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for log_id in log_ids:
             try:
-                # Forward original msg to Log Channel
                 await context.bot.forward_message(
                     chat_id=log_id,
                     from_chat_id=chat_id,
@@ -433,7 +459,6 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
         media_id = msg.photo[-1].file_id if msg.photo else msg.video.file_id
         media_type = "photo" if msg.photo else "video"
         
-        # Anti-Duplicate Unique Hash
         unique_hash = hashlib.md5(f"{media_type}_{media_id[-20:]}".encode()).hexdigest()
 
         if media_col.find_one({"hash": unique_hash}):
@@ -481,7 +506,8 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------------------
 async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_owner(user_id):
+    if not can_run_command(user_id, "can_stats"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
 
     dm_users = users_col.count_documents({})
@@ -515,7 +541,8 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Group Broadcast: `/send_group Message`", parse_mode="Markdown")
 
 async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_broadcast"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     text = " ".join(context.args)
     if not text:
@@ -534,7 +561,8 @@ async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {count} DM users.")
 
 async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_broadcast"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     text = " ".join(context.args)
     if not text:
@@ -554,30 +582,23 @@ async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {sent_count}/{len(targets)} Target Groups!")
 
 # -------------------------------------------------------------
-# MAIN APPLICATION BOOTSTRAP (MENU BUTTON INTEGRATED)
+# 12. MAIN BOOTSTRAP & COMMAND SCOPES
 # -------------------------------------------------------------
 async def post_init(application: Application):
-    commands = [
-        BotCommand("start", "Bot ko start ya restart karein"),
-        BotCommand("list_groups", "Saari active groups aur config list karein"),
-        BotCommand("add_target", "Target Group add karein"),
-        BotCommand("del_target", "Target Group remove karein"),
-        BotCommand("add_source", "Source Group add karein"),
-        BotCommand("del_source", "Source Group remove karein"),
-        BotCommand("add_log", "Log Group add karein"),
-        BotCommand("del_log", "Log Group remove karein"),
-        BotCommand("add_owner", "Owner add karein"),
-        BotCommand("del_owner", "Owner remove karein"),
-        BotCommand("add_badword", "Word block karein"),
-        BotCommand("del_badword", "Word unblock karein"),
-        BotCommand("set_caption", "Custom Caption set karein"),
-        BotCommand("reset_caption", "Caption reset karein"),
-        BotCommand("stats", "Dashboard aur System Stats dekhein"),
-        BotCommand("promote", "Member ko Admin banaayein"),
-        BotCommand("demote", "Admin ko Demote karein"),
+    user_commands = [
+        BotCommand("start", "Bot ko start karein"),
     ]
-    await application.bot.set_my_commands(commands)
-    print("✅ Bot Menu Commands successfully set for all users!")
+    await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+
+    admin_commands = [
+        BotCommand("start", "Bot ko start karein"),
+        BotCommand("promote", "Group member ko Promote karein"),
+        BotCommand("demote", "Admin ko Demote karein"),
+        BotCommand("stats", "Dashboard aur Stats dekhein"),
+    ]
+    await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeAllChatAdministrators())
+
+    print("✅ Command Scopes setup completed successfully!")
 
 def main():
     if not BOT_TOKEN:
@@ -612,9 +633,9 @@ def main():
     app.add_handler(CommandHandler("send_users", broadcast_users))
     app.add_handler(CommandHandler("send_group", broadcast_group))
     app.add_handler(CallbackQueryHandler(button_click_handler))
-    
+
     # Event Handlers
-    app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
 
@@ -623,7 +644,7 @@ def main():
         app.job_queue.run_repeating(auto_post_media_job, interval=300, first=10)
 
     print("🤖 Telegram Bot Polling Started!")
-    app.run_polling(allowed_updates=["chat_member", "message", "callback_query"], stop_signals=None)
+    app.run_polling(allowed_updates=["message", "callback_query"], stop_signals=None)
 
 if __name__ == '__main__':
     main()
