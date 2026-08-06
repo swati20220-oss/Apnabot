@@ -6,7 +6,14 @@ import threading
 from datetime import datetime, timezone
 from flask import Flask
 from google import genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    BotCommand, 
+    BotCommandScopeDefault, 
+    BotCommandScopeAllChatAdministrators
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -63,7 +70,7 @@ if INITIAL_ADMIN != "0" and INITIAL_ADMIN.replace('-', '').isdigit():
 ALL_URL_REGEX = r'((https?://|www\.)[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[^\s]*)?|t\.me/[^\s]+|telegram\.me/[^\s]+)'
 
 # -------------------------------------------------------------
-# 3. HELPER FUNCTIONS FOR DYNAMIC CONFIGURATION
+# 3. HELPER FUNCTIONS FOR PERMISSIONS & DYNAMIC CONFIG
 # -------------------------------------------------------------
 def get_db_ids(config_key):
     doc = config_col.find_one({"_id": config_key})
@@ -83,12 +90,17 @@ def get_custom_caption():
     doc = config_col.find_one({"_id": "branding_caption"})
     return doc.get("text", "") if doc else ""
 
-def has_admin_permission(user_id, perm_name):
+# SECURITY GUARD: Strictly Check Permission from Database
+def can_run_command(user_id: int, required_perm: str) -> bool:
+    # 1. Owner ko sabhi permissions accessible hain
     if is_owner(user_id):
         return True
+    
+    # 2. Check Database if Owner granted this permission to Admin
     perm_doc = admin_perms_col.find_one({"user_id": user_id})
-    if perm_doc and perm_doc.get("permissions", {}).get(perm_name, False):
+    if perm_doc and perm_doc.get("permissions", {}).get(required_perm, False):
         return True
+        
     return False
 
 # -------------------------------------------------------------
@@ -103,8 +115,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upsert=True
         )
     await update.message.reply_text(
-        f"Namaste {user.first_name}! Main aapka Dynamic Telegram Group Manager & Gemini AI Assistant Bot hoon.\n\n"
-        f"Aap bot database mein successfully registered hain!"
+        f"Namaste {user.first_name}! Main aapka Dynamic Group Manager Bot hoon.\n\n"
+        f"Aap system mein successfully registered hain!"
     )
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -170,15 +182,15 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Kuch technical issue aa gaya, thodi der baad try karein!")
 
 # -------------------------------------------------------------
-# 6. ADVANCED ADMIN CONTROL COMMANDS
+# 6. PERMISSION-PROTECTED ADMIN CONTROL COMMANDS
 # -------------------------------------------------------------
 async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     chat = update.effective_chat
     user = update.effective_user
 
-    if not has_admin_permission(user.id, "can_promote"):
-        await msg.reply_text("⛔ Access Denied! Aapke paas `can_promote` permission nahi hai.")
+    if not can_run_command(user.id, "can_promote"):
+        await msg.reply_text("⛔ Access Denied! Aapke paas `/promote` use karne ki permission nahi hai.")
         return
 
     if not msg.reply_to_message and not context.args:
@@ -211,8 +223,8 @@ async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
 
-    if not is_owner(user.id):
-        await msg.reply_text("⛔ Sirf Bot Owner hi kisi ko demote kar sakta hai!")
+    if not can_run_command(user.id, "can_demote"):
+        await msg.reply_text("⛔ Access Denied! Aapke paas `/demote` use karne ki permission nahi hai.")
         return
 
     if not msg.reply_to_message and not context.args:
@@ -239,11 +251,15 @@ async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not is_owner(update.effective_user.id):
-        await msg.reply_text("⛔ Sirf Owner permissions set kar sakta hai!")
+        await msg.reply_text("⛔ Sirf Owner hi Admin permissions set kar sakta hai!")
         return
 
     if len(context.args) < 3:
-        await msg.reply_text("Usage: `/set_perm <user_id> <permission_name> true/false`", parse_mode="Markdown")
+        await msg.reply_text(
+            "Usage: `/set_perm <user_id> <permission_name> true/false`\n"
+            "Permissions Example: `can_promote`, `can_config`, `can_badwords`, `can_caption`", 
+            parse_mode="Markdown"
+        )
         return
 
     try:
@@ -256,15 +272,17 @@ async def set_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$set": {f"permissions.{perm_name}": val}},
             upsert=True
         )
-        await msg.reply_text(f"✅ Permission `{perm_name}` = `{val}` set for `{target_id}`", parse_mode="Markdown")
+        await msg.reply_text(f"✅ Permission `{perm_name}` = `{val}` set for User `{target_id}`", parse_mode="Markdown")
     except Exception as e:
         await msg.reply_text(f"❌ Error setting permission: {e}")
 
 # -------------------------------------------------------------
-# 7. DYNAMIC LIVE GROUP & OWNER CONFIGURATION
+# 7. DYNAMIC CONFIGURATION & MANAGEMENT
 # -------------------------------------------------------------
 async def list_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not can_run_command(user_id, "can_config"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     
     badwords_doc = badwords_col.find_one({"_id": "word_list"})
@@ -282,10 +300,17 @@ async def list_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    cmd = update.message.text.split()[0].lower()
+
+    if cmd in ["/add_owner", "/del_owner"] and not is_owner(user_id):
+        await update.message.reply_text("⛔ Sirf Owner hi naye Owners add/remove kar sakta hai!")
         return
 
-    cmd = update.message.text.split()[0].lower()
+    if not can_run_command(user_id, "can_config"):
+        await update.message.reply_text("⛔ Access Denied! Configuration badalne ki permission nahi hai.")
+        return
+
     if not context.args:
         await update.message.reply_text(f"Usage: `{cmd} <ID>`", parse_mode="Markdown")
         return
@@ -293,7 +318,7 @@ async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid ID! Enter a numeric ID.")
+        await update.message.reply_text("❌ Invalid ID! Numeric ID enter karein.")
         return
 
     mapping = {
@@ -319,7 +344,8 @@ async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TY
 # 8. BADWORD FILTER & BRANDING CAPTION COMMANDS
 # -------------------------------------------------------------
 async def add_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_badwords"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     if not context.args:
         await update.message.reply_text("Usage: `/add_badword <word>`", parse_mode="Markdown")
@@ -330,7 +356,8 @@ async def add_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Badword added: `{word}`", parse_mode="Markdown")
 
 async def del_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_badwords"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     if not context.args:
         await update.message.reply_text("Usage: `/del_badword <word>`", parse_mode="Markdown")
@@ -341,7 +368,8 @@ async def del_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Badword removed: `{word}`", parse_mode="Markdown")
 
 async def set_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_caption"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     caption_text = " ".join(context.args)
     if not caption_text:
@@ -352,7 +380,8 @@ async def set_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"✅ Custom Caption Set:\n\n{caption_text}")
 
 async def reset_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_caption"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     config_col.delete_one({"_id": "branding_caption"})
     await update.message.reply_text("✅ Custom Caption Reset To Default.")
@@ -380,7 +409,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_ai_chat(update, context)
         return
 
-    # 2. Admin Status Check
+    # 2. Admin Status Check (Ignore Admins & Owners)
     try:
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
         if chat_member.status in ["administrator", "creator"] or is_owner(user_id):
@@ -401,7 +430,6 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for log_id in log_ids:
             try:
-                # Forward original msg to Log Channel
                 await context.bot.forward_message(
                     chat_id=log_id,
                     from_chat_id=chat_id,
@@ -433,7 +461,6 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
         media_id = msg.photo[-1].file_id if msg.photo else msg.video.file_id
         media_type = "photo" if msg.photo else "video"
         
-        # Anti-Duplicate Unique Hash
         unique_hash = hashlib.md5(f"{media_type}_{media_id[-20:]}".encode()).hexdigest()
 
         if media_col.find_one({"hash": unique_hash}):
@@ -481,7 +508,8 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------------------
 async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_owner(user_id):
+    if not can_run_command(user_id, "can_stats"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
 
     dm_users = users_col.count_documents({})
@@ -515,7 +543,8 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Group Broadcast: `/send_group Message`", parse_mode="Markdown")
 
 async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_broadcast"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     text = " ".join(context.args)
     if not text:
@@ -534,7 +563,8 @@ async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {count} DM users.")
 
 async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not can_run_command(update.effective_user.id, "can_broadcast"):
+        await update.message.reply_text("⛔ Access Denied!")
         return
     text = " ".join(context.args)
     if not text:
@@ -554,30 +584,25 @@ async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {sent_count}/{len(targets)} Target Groups!")
 
 # -------------------------------------------------------------
-# MAIN APPLICATION BOOTSTRAP (MENU BUTTON INTEGRATED)
+# 12. SCOPE-BASED MENU COMMANDS BOOTSTRAP
 # -------------------------------------------------------------
 async def post_init(application: Application):
-    commands = [
-        BotCommand("start", "Bot ko start ya restart karein"),
-        BotCommand("list_groups", "Saari active groups aur config list karein"),
-        BotCommand("add_target", "Target Group add karein"),
-        BotCommand("del_target", "Target Group remove karein"),
-        BotCommand("add_source", "Source Group add karein"),
-        BotCommand("del_source", "Source Group remove karein"),
-        BotCommand("add_log", "Log Group add karein"),
-        BotCommand("del_log", "Log Group remove karein"),
-        BotCommand("add_owner", "Owner add karein"),
-        BotCommand("del_owner", "Owner remove karein"),
-        BotCommand("add_badword", "Word block karein"),
-        BotCommand("del_badword", "Word unblock karein"),
-        BotCommand("set_caption", "Custom Caption set karein"),
-        BotCommand("reset_caption", "Caption reset karein"),
-        BotCommand("stats", "Dashboard aur System Stats dekhein"),
-        BotCommand("promote", "Member ko Admin banaayein"),
-        BotCommand("demote", "Admin ko Demote karein"),
+    # 1. Normal Users Menu (Public Menu)
+    user_commands = [
+        BotCommand("start", "Bot ko start karein"),
     ]
-    await application.bot.set_my_commands(commands)
-    print("✅ Bot Menu Commands successfully set for all users!")
+    await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+
+    # 2. Group Admins Menu
+    admin_commands = [
+        BotCommand("start", "Bot ko start karein"),
+        BotCommand("promote", "Group member ko Promote karein"),
+        BotCommand("demote", "Admin ko Demote karein"),
+        BotCommand("stats", "Dashboard aur Stats dekhein"),
+    ]
+    await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeAllChatAdministrators())
+
+    print("✅ Command Scopes configured successfully! Sensitive commands are now hidden from public users.")
 
 def main():
     if not BOT_TOKEN:
