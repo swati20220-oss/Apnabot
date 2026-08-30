@@ -1,7 +1,6 @@
 import os
 import re
 import asyncio
-import hashlib
 import threading
 from datetime import datetime, timezone
 from flask import Flask
@@ -93,7 +92,7 @@ def can_run_command(user_id: int, required_perm: str) -> bool:
     return False
 
 # -------------------------------------------------------------
-# 4. WELCOME & USER REGISTRATION SYSTEM (UPDATED MESSAGE)
+# 4. WELCOME & USER REGISTRATION SYSTEM 
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -119,7 +118,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         stats_col.update_one({"_id": "total_joins"}, {"$inc": {"count": 1}}, upsert=True)
 
-        # Aapke template ke hisaab se HTML formatted message (@username ki jagah real mention)
         user_mention = f'<a href="tg://user?id={new_member.id}">{new_member.full_name}</a>'
         welcome_text = (
             f"🎉 <b>Welcome to Our Telegram Group!</b> 🎉\n\n"
@@ -148,7 +146,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         except Exception as e:
             print(f"Welcome Message Error: {e}")
-
 
 # -------------------------------------------------------------
 # 5. ADVANCED ADMIN CONTROL COMMANDS
@@ -405,57 +402,26 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Delete Error: {del_err}")
 
 # -------------------------------------------------------------
-# 9. MULTI-SOURCE MEDIA FETCHING & ANTI-DUPLICATE HASHING
+# 9. INSTANT MULTI-SOURCE MEDIA FORWARDING (NO DELAY)
 # -------------------------------------------------------------
 async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     source_ids = get_db_ids("source_groups")
+    target_ids = get_db_ids("target_groups")
 
     if msg and msg.chat.id in source_ids and (msg.photo or msg.video):
-        media_id = msg.photo[-1].file_id if msg.photo else msg.video.file_id
-        media_type = "photo" if msg.photo else "video"
+        custom_caption = get_custom_caption()
         
-        unique_hash = hashlib.md5(f"{media_type}_{media_id[-20:]}".encode()).hexdigest()
-
-        if media_col.find_one({"hash": unique_hash}):
-            return
-
-        media_col.update_one(
-            {"hash": unique_hash},
-            {"$set": {
-                "media_id": media_id, 
-                "type": media_type, 
-                "hash": unique_hash, 
-                "sent": False, 
-                "added_at": datetime.now(timezone.utc)
-            }},
-            upsert=True
-        )
-
-async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
-    target_ids = get_db_ids("target_groups")
-    if not target_ids:
-        return
-
-    custom_caption = get_custom_caption()
-    unsent_media = list(media_col.find({"sent": False}).limit(10))
-
-    for media in unsent_media:
-        try:
-            for target_id in target_ids:
-                try:
-                    if media['type'] == 'photo':
-                        await context.bot.send_photo(chat_id=target_id, photo=media['media_id'], caption=custom_caption)
-                    elif media['type'] == 'video':
-                        await context.bot.send_video(chat_id=target_id, video=media['media_id'], caption=custom_caption)
-                    await asyncio.sleep(1)
-                except Exception as group_err:
-                    print(f"Target Error {target_id}: {group_err}")
-
-            media_col.update_one({"_id": media["_id"]}, {"$set": {"sent": True}})
-            await asyncio.sleep(3)
-        except Exception as e:
-            print(f"Cron Error: {e}")
+        for target_id in target_ids:
+            try:
+                await context.bot.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=msg.chat.id,
+                    message_id=msg.message_id,
+                    caption=custom_caption if custom_caption else msg.caption
+                )
+            except Exception as group_err:
+                print(f"Target Error {target_id}: {group_err}")
 
 # -------------------------------------------------------------
 # 10. STATS, DASHBOARD & BROADCAST SYSTEM
@@ -468,7 +434,6 @@ async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     dm_users = users_col.count_documents({})
     joins_data = stats_col.find_one({"_id": "total_joins"}) or {"count": 0}
-    media_pending = media_col.count_documents({"sent": False})
 
     text = (
         f"📊 **BOT SYSTEM DASHBOARD & STATS**\n\n"
@@ -478,7 +443,6 @@ async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📢 **Log Groups:** `{len(get_db_ids('log_groups'))}`\n"
         f"📥 **Source Groups:** `{len(get_db_ids('source_groups'))}`\n"
         f"📤 **Target Groups:** `{len(get_db_ids('target_groups'))}`\n"
-        f"🖼️ **Pending Media Jobs:** `{media_pending}`\n"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Broadcast Users (DM)", callback_data="bc_users")],
@@ -593,10 +557,6 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), handle_messages))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), fetch_source_media))
-
-    # Job Queue Scheduler (Every 5 mins)
-    if app.job_queue:
-        app.job_queue.run_repeating(auto_post_media_job, interval=300, first=10)
 
     print("🤖 Telegram Bot Polling Started!")
     app.run_polling(allowed_updates=["message", "callback_query"], stop_signals=None)
