@@ -5,7 +5,6 @@ import hashlib
 import threading
 from datetime import datetime, timezone
 from flask import Flask
-from google import genai
 from telegram import (
     Update, 
     InlineKeyboardButton, 
@@ -42,12 +41,8 @@ def run_flask_in_background():
 # -------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WELCOME_LINK = os.getenv("WELCOME_LINK", "https://t.me")
 INITIAL_ADMIN = os.getenv("ADMIN_ID", "0")
-
-# Gemini AI Client Init
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # MongoDB Connection
 client = MongoClient(MONGO_URI)
@@ -98,7 +93,7 @@ def can_run_command(user_id: int, required_perm: str) -> bool:
     return False
 
 # -------------------------------------------------------------
-# 4. WELCOME & USER REGISTRATION SYSTEM (FIXED EVENT)
+# 4. WELCOME & USER REGISTRATION SYSTEM (UPDATED MESSAGE)
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -109,7 +104,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upsert=True
         )
     await update.message.reply_text(
-        f"Namaste {user.first_name}! Main aapka Dynamic Telegram Group Manager & Gemini AI Assistant Bot hoon.\n\n"
+        f"Namaste {user.first_name}! Main aapka Dynamic Telegram Group Manager Bot hoon.\n\n"
         f"Aap bot database mein successfully registered hain!"
     )
 
@@ -124,11 +119,21 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         stats_col.update_one({"_id": "total_joins"}, {"$inc": {"count": 1}}, upsert=True)
 
+        # Aapke template ke hisaab se HTML formatted message (@username ki jagah real mention)
         user_mention = f'<a href="tg://user?id={new_member.id}">{new_member.full_name}</a>'
         welcome_text = (
-            f"Aapka swagat hai {user_mention}! 🎉\n\n"
-            f"Group rules follow karein aur niche button par click karke bot ko DM mein START karein!"
+            f"🎉 <b>Welcome to Our Telegram Group!</b> 🎉\n\n"
+            f"👋 Hey {user_mention}, aapka hamare group me dil se swagat hai! 💙\n\n"
+            f"✨ Ab aap hamari awesome GROUP ka hissa hain.\n"
+            f"📢 Group explore karo, participate karo aur active raho.\n\n"
+            f"📌 <b>Group Rules:</b>\n"
+            f"✅ ONLY ACTIVE USER \n"
+            f"🚫 No Spam\n"
+            f"💙 DAILY SEND VIDEO OR PHOTO \n\n"
+            f"🤝 NO ACTIVE OR NO VIDEO SEND , I REMOVE USER \n"
+            f"🙏 Thanks for joining and enjoy your stay! 🎊"
         )
+        
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(text="🔗 Official Link", url=WELCOME_LINK)],
             [InlineKeyboardButton(text="🤖 Bot Ko Start Karein", url=f"https://t.me/{context.bot.username}?start=welcome")]
@@ -144,48 +149,9 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             print(f"Welcome Message Error: {e}")
 
-# -------------------------------------------------------------
-# 5. GEMINI AI AUTO-REPLY SYSTEM
-# -------------------------------------------------------------
-async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text or not ai_client:
-        return
-
-    bot_username = context.bot.username
-    text = msg.text
-
-    is_tagged = f"@{bot_username}" in text
-    is_reply = (
-        msg.reply_to_message 
-        and msg.reply_to_message.from_user 
-        and msg.reply_to_message.from_user.id == context.bot.id
-    )
-
-    if is_tagged or is_reply:
-        prompt = text.replace(f"@{bot_username}", "").strip()
-        if not prompt:
-            await msg.reply_text("Haan ji, boliye! Main aapki kya help kar sakta hoon?")
-            return
-
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-
-        try:
-            response = ai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={
-                    "system_instruction": "Aap ek friendly, smart aur helpful Telegram Assistant hain. Concise aur clear Hinglish mein answer dein."
-                }
-            )
-            if response.text:
-                await msg.reply_text(response.text)
-        except Exception as e:
-            print(f"Gemini AI Error: {e}")
-            await msg.reply_text("Kuch technical issue aa gaya, thodi der baad try karein!")
 
 # -------------------------------------------------------------
-# 6. ADVANCED ADMIN CONTROL COMMANDS
+# 5. ADVANCED ADMIN CONTROL COMMANDS
 # -------------------------------------------------------------
 async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -276,7 +242,7 @@ async def set_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ Error setting permission: {e}")
 
 # -------------------------------------------------------------
-# 7. DYNAMIC LIVE GROUP & OWNER CONFIGURATION
+# 6. DYNAMIC LIVE GROUP & OWNER CONFIGURATION
 # -------------------------------------------------------------
 async def list_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_run_command(update.effective_user.id, "can_config"):
@@ -339,7 +305,7 @@ async def manage_dynamic_config(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"✅ {msg_text}: `{target_id}`", parse_mode="Markdown")
 
 # -------------------------------------------------------------
-# 8. BADWORD FILTER & BRANDING CAPTION COMMANDS
+# 7. BADWORD FILTER & BRANDING CAPTION COMMANDS
 # -------------------------------------------------------------
 async def add_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_run_command(update.effective_user.id, "can_badwords"):
@@ -385,7 +351,7 @@ async def reset_caption_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("✅ Custom Caption Reset To Default.")
 
 # -------------------------------------------------------------
-# 9. ALL LINKS & BADWORD ERASER + MULTI-LOG FORWARDING
+# 8. ALL LINKS & BADWORD ERASER + MULTI-LOG FORWARDING
 # -------------------------------------------------------------
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -397,17 +363,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_title = chat.title or "Unknown Group"
     user_id = msg.from_user.id
 
-    # 1. Gemini AI Trigger Check
-    bot_username = context.bot.username
-    is_ai_trigger = (f"@{bot_username}" in msg.text) or (
-        msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id
-    )
-
-    if is_ai_trigger:
-        await handle_ai_chat(update, context)
-        return
-
-    # 2. Admin Status Check
+    # 1. Admin Status Check
     try:
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
         if chat_member.status in ["administrator", "creator"] or is_owner(user_id):
@@ -415,7 +371,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # 3. Check Badwords & Links
+    # 2. Check Badwords & Links
     badwords_doc = badwords_col.find_one({"_id": "word_list"})
     badwords = badwords_doc.get("words", []) if badwords_doc else []
     
@@ -449,7 +405,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Delete Error: {del_err}")
 
 # -------------------------------------------------------------
-# 10. MULTI-SOURCE MEDIA FETCHING & ANTI-DUPLICATE HASHING
+# 9. MULTI-SOURCE MEDIA FETCHING & ANTI-DUPLICATE HASHING
 # -------------------------------------------------------------
 async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -502,7 +458,7 @@ async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
             print(f"Cron Error: {e}")
 
 # -------------------------------------------------------------
-# 11. STATS, DASHBOARD & BROADCAST SYSTEM
+# 10. STATS, DASHBOARD & BROADCAST SYSTEM
 # -------------------------------------------------------------
 async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -523,7 +479,6 @@ async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📥 **Source Groups:** `{len(get_db_ids('source_groups'))}`\n"
         f"📤 **Target Groups:** `{len(get_db_ids('target_groups'))}`\n"
         f"🖼️ **Pending Media Jobs:** `{media_pending}`\n"
-        f"🤖 **Gemini AI Status:** `{'Active ✅' if ai_client else 'Inactive ❌'}`\n"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Broadcast Users (DM)", callback_data="bc_users")],
@@ -582,7 +537,7 @@ async def broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {sent_count}/{len(targets)} Target Groups!")
 
 # -------------------------------------------------------------
-# 12. MAIN BOOTSTRAP & COMMAND SCOPES
+# 11. MAIN BOOTSTRAP & COMMAND SCOPES
 # -------------------------------------------------------------
 async def post_init(application: Application):
     user_commands = [
